@@ -1,0 +1,4 @@
+.env
+state.json
+relay.db
+__pycache__/
