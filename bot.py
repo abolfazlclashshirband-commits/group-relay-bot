@@ -18,9 +18,12 @@ import os
 import random
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import httpx
+
+import fal
 
 # ----------------------------------------------------------------- config
 BASE_DIR = Path(__file__).parent
@@ -44,6 +47,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOU
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 DB_FILE = DATA_DIR / "relay.db"
+FAL_MAX_LEN = int(os.environ.get("FAL_MAX_LEN", "80"))         # پیام‌های بلندتر فال حساب نمی‌شوند
 ENV_GROUP_ID = os.environ.get("GROUP_ID", "").strip()  # اختیاری؛ پشتیبان اگر state پاک شد
 
 logging.basicConfig(
@@ -62,6 +66,7 @@ DEFAULT_STATE = {
     "stream": True,        # ارسال تدریجی فعال؟
     "mirror": True,        # نمایش پیام‌های گروه در PV فعال؟
     "draft_ok": True,      # اگر sendMessageDraft خطا داد خودکار False می‌شود
+    "fal": True,           # فالگیر برای اعضای گروه فعال؟
 }
 
 
@@ -92,6 +97,8 @@ db.execute(
 db.execute("CREATE TABLE IF NOT EXISTS senders (grp_id INTEGER, user_id INTEGER, name TEXT)")
 db.execute("CREATE INDEX IF NOT EXISTS i_sender ON senders(grp_id)")
 db.execute("CREATE TABLE IF NOT EXISTS whispers (pv_id INTEGER, receiver INTEGER, eph_id INTEGER)")
+db.execute("CREATE TABLE IF NOT EXISTS fal_msgs (grp_id INTEGER)")
+db.execute("CREATE INDEX IF NOT EXISTS i_fal ON fal_msgs(grp_id)")
 db.execute("CREATE INDEX IF NOT EXISTS i_pv ON map(pv_id)")
 db.execute("CREATE INDEX IF NOT EXISTS i_grp ON map(grp_id)")
 db.commit()
@@ -100,6 +107,15 @@ db.commit()
 def map_add(pv_id, grp_id, origin):
     db.execute("INSERT INTO map VALUES (?,?,?)", (pv_id, grp_id, origin))
     db.commit()
+
+
+def fal_msg_add(grp_id):
+    db.execute("INSERT INTO fal_msgs VALUES (?)", (grp_id,))
+    db.commit()
+
+
+def is_fal_msg(grp_id):
+    return db.execute("SELECT 1 FROM fal_msgs WHERE grp_id=?", (grp_id,)).fetchone() is not None
 
 
 def sender_add(grp_id, user_id, name):
@@ -156,6 +172,7 @@ class ApiError(Exception):
 
 _client: httpx.AsyncClient = None
 BOT_ID = None
+BOT_USERNAME = ""
 
 
 async def api(method, **params):
@@ -216,7 +233,9 @@ def build_prefix(msg, edited=False, quote=None):
     rt = msg.get("reply_to_message")
     if rt:
         rfrom = rt.get("from") or {}
-        if rfrom.get("id") == BOT_ID:
+        if rfrom.get("id") == BOT_ID and is_fal_msg(rt["message_id"]):
+            lines += "↩️ پاسخ به ربات فال\n"
+        elif rfrom.get("id") == BOT_ID:
             lines += "↩️ پاسخ به شما\n"
         else:
             lines += f"↩️ پاسخ به {sender_name(rt.get('sender_chat') or rfrom)}\n"
@@ -648,6 +667,7 @@ HELP = (
     "پیام‌های گروه هم اینجا نمایش داده می‌شود.\n\n"
     "دستورها:\n"
     "/status — وضعیت\n"
+    "/fal on|off — فالگیر گروه (ریپلای روی پیام عضو + /fal [تاروت]: فال برای او)\n"
     "/stream — روشن/خاموش ارسال تدریجی\n"
     "/mirror — روشن/خاموش نمایش پیام‌های گروه (و ری‌اکشن‌ها)\n"
     "/w متن — (ریپلای روی پیام یک عضو) نجوا: فقط همان عضو در گروه می‌بیند\n"
@@ -720,6 +740,31 @@ async def owner_command(msg):
         await api("sendMessage", chat_id=cid, text=HELP)
     elif cmd == "/w":
         await whisper_command(msg)
+    elif cmd == "/fal":
+        args = msg["text"].split()[1:]
+        sub = args[0].lower() if args else ""
+        rt = msg.get("reply_to_message")
+        if sub in ("on", "off"):
+            STATE["fal"] = sub == "on"
+            save_state()
+            await api("sendMessage", chat_id=cid, text=f"فالگیر گروه: {onoff(STATE['fal'])}")
+        elif not rt or sub == "status":
+            await api(
+                "sendMessage",
+                chat_id=cid,
+                text=f"🔮 فالگیر گروه: {onoff(STATE['fal'])}\n"
+                "/fal on | /fal off\n"
+                "برای گرفتن فال برای یک عضو: روی پیامش ریپلای کن و بنویس /fal یا /fal تاروت",
+            )
+        else:
+            gid = pv_to_grp(rt["message_id"])
+            if not gid or not STATE["group_id"]:
+                await api("sendMessage", chat_id=cid, text="❌ این پیام در گروه نیست.")
+                return
+            who = sender_of(gid)
+            kind = fal.classify("فال " + " ".join(args)) or "hafez"
+            asyncio.create_task(send_fortune(kind, gid, None, who[1] if who else None, gid))
+            await react(cid, msg["message_id"], "🔥")
     elif cmd == "/status":
         g = STATE["group_id"]
         title = "—"
@@ -735,6 +780,7 @@ async def owner_command(msg):
                 f"گروه: {title}\n"
                 f"ارسال تدریجی: {onoff(STATE['stream'])}\n"
                 f"نمایش پیام‌های گروه: {onoff(STATE['mirror'])}\n"
+                f"فالگیر گروه: {onoff(STATE['fal'])}\n"
                 f"sendMessageDraft: {'فعال' if STATE['draft_ok'] else 'غیرفعال (خطا داد)'}"
             ),
         )
@@ -844,6 +890,81 @@ async def reaction_update(ev):
     except ApiError as e:
         log.error("reaction mirror failed: %s", e)
 
+
+# ----------------------------------------------------------------- fortune (فالگیر)
+async def send_fortune(kind, reply_to, thread_id=None, who=None, notify_pv_for=None):
+    """
+    فال را در گروه لینک‌شده می‌فرستد: «در حال تایپ…» + چند پیام پشت‌سرهم (مثل نمایش تدریجی).
+    reply_to: شناسهٔ پیام گروه که فال روی آن ریپلای می‌شود.
+    """
+    gid = STATE["group_id"]
+    if not gid:
+        return
+    rp = {"message_id": reply_to, "allow_sending_without_reply": True} if reply_to else None
+    try:
+        parts = fal.make(kind)
+        async with Typing(gid):
+            for i, part in enumerate(parts):
+                await asyncio.sleep(1.2)
+                res = await api(
+                    "sendMessage",
+                    chat_id=gid,
+                    text=part,
+                    parse_mode="HTML",
+                    reply_parameters=rp,
+                    message_thread_id=thread_id,
+                )
+                fal_msg_add(res["message_id"])
+    except ApiError as e:
+        log.error("fortune failed: %s", e)
+        return
+    if STATE["mirror"] and who:
+        label = "تاروت" if kind == "tarot" else "حافظ"
+        pv_id = grp_to_pv(notify_pv_for) if notify_pv_for else None
+        try:
+            await api(
+                "sendMessage",
+                chat_id=OWNER_ID,
+                text=f"🔮 فال {label} برای {who} گرفته شد",
+                reply_parameters={"message_id": pv_id, "allow_sending_without_reply": True} if pv_id else None,
+                disable_notification=True,
+            )
+        except ApiError:
+            pass
+
+
+async def maybe_fortune(msg):
+    """اگر عضوی در گروه «فال» گفت، برایش فال می‌گیرد."""
+    if not STATE["fal"] or not fal.READY:
+        return
+    frm = msg.get("from") or {}
+    text = (msg.get("text") or "").strip()
+    if not text or frm.get("is_bot") or not frm.get("id"):
+        return
+    kind = None
+    if text.startswith("/"):
+        first, _, rest = text.partition(" ")
+        cmd, _, target = first.partition("@")
+        if target and target.lower() != BOT_USERNAME:
+            return  # دستور برای ربات دیگری است
+        cmd = cmd.lower()
+        if cmd == "/fal":
+            kind = fal.classify("فال " + rest)
+        elif cmd == "/start":
+            try:
+                await api("sendMessage", chat_id=msg["chat"]["id"], text=fal.INTRO, parse_mode="HTML")
+            except ApiError:
+                pass
+            return
+    elif len(text) <= FAL_MAX_LEN:
+        kind = fal.classify(text)
+    if not kind:
+        return
+    thread = msg.get("message_thread_id") if msg.get("is_topic_message") else None
+    asyncio.create_task(
+        send_fortune(kind, msg["message_id"], thread, sender_name(frm), msg["message_id"])
+    )
+
 # ----------------------------------------------------------------- update routing
 async def leave(chat_id):
     try:
@@ -943,17 +1064,20 @@ async def handle_update(upd):
             if any(k in msg for k in ("new_chat_members", "left_chat_member")):
                 await group_service(msg)
             else:
+                if not edited:
+                    await maybe_fortune(msg)
                 await group_message(msg, edited=edited)
         return
 
 
 async def main():
-    global _client, BOT_ID
+    global _client, BOT_ID, BOT_USERNAME
     if not BOT_TOKEN or OWNER_ID <= 0:
         sys.exit("BOT_TOKEN و OWNER_ID (عدد مثبت) را تنظیم کن؛ بدون آنها ربات اجرا نمی‌شود.")
     _client = httpx.AsyncClient()
     me = await api("getMe")
     BOT_ID = me["id"]
+    BOT_USERNAME = (me.get("username") or "").lower()
     await api("deleteWebhook")
     log.info("Started as @%s (owner=%s, group=%s)", me.get("username"), OWNER_ID, STATE["group_id"])
     try:
